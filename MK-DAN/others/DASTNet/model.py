@@ -1,0 +1,303 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GradReverse(torch.autograd.Function):
+    """
+    Extension of grad reverse layer
+    """
+    @staticmethod
+    def forward(ctx, x, constant):
+        ctx.constant = constant
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output = grad_output.neg() * ctx.constant
+        return grad_output, None
+
+    def grad_reverse(x, constant):
+        return GradReverse.apply(x, constant)
+
+
+class Grad(torch.autograd.Function):
+    """
+    Extension of grad reverse layer
+    """
+    @staticmethod
+    def forward(ctx, x, constant):
+        ctx.constant = constant
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output = grad_output * ctx.constant
+        return grad_output, None
+
+    def grad(x, constant):
+        return Grad.apply(x, constant)
+
+class Domain_classifier_DG(nn.Module):
+
+    def __init__(self, num_class, encode_dim):
+        super(Domain_classifier_DG, self).__init__()
+
+        self.num_class = num_class
+        self.encode_dim = encode_dim
+
+        self.fc1 = nn.Linear(self.encode_dim, 16)
+        self.fc2 = nn.Linear(16, num_class)
+
+    def forward(self, input, constant, Reverse):
+        if Reverse:
+            input = GradReverse.grad_reverse(input, constant)
+        else:
+            input = Grad.grad(input, constant)
+        logits = torch.tanh(self.fc1(input))
+        logits = self.fc2(logits)
+        logits = F.log_softmax(logits, 1)
+
+        return logits
+
+class VGRULinear(nn.Module):
+    def __init__(self, num_gru_units: int, output_dim: int, bias: float = 0.0):
+        super(VGRULinear, self).__init__()
+        self._num_gru_units = num_gru_units
+        self._output_dim = output_dim
+        self._bias_init_value = bias
+        self.weights = nn.Parameter(
+            torch.FloatTensor(self._num_gru_units + 1, self._output_dim)
+        )
+        self.biases = nn.Parameter(torch.FloatTensor(self._output_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weights)
+        nn.init.constant_(self.biases, self._bias_init_value)
+
+    def forward(self, inputs, hidden_state):
+        batch_size, num_nodes = inputs.shape[0], inputs.shape[1]
+        inputs = inputs.reshape((batch_size, num_nodes, 1))
+        hidden_state = hidden_state.reshape((batch_size, num_nodes, self._num_gru_units))
+        concatenation = torch.cat((inputs, hidden_state), dim=2)
+        concatenation = concatenation.reshape((-1, self._num_gru_units + 1))
+        outputs = concatenation @ self.weights + self.biases
+        outputs = outputs.reshape((batch_size, num_nodes, self._output_dim))
+        outputs = outputs.reshape((batch_size, num_nodes * self._output_dim))
+        return outputs
+
+    def hyperparameters(self):
+        return {
+            "num_gru_units": self._num_gru_units,
+            "output_dim": self._output_dim,
+            "bias_init_value": self._bias_init_value,
+        }
+
+
+class VGRUCell(nn.Module):
+    def __init__(self, hidden_dim: int, adj_encodedim):
+        super(VGRUCell, self).__init__()
+        self._encode_dim = adj_encodedim
+        self._hidden_dim = hidden_dim
+        self.weights = nn.Parameter(
+            torch.FloatTensor(self._encode_dim, self._encode_dim)
+        )
+        self.bias = nn.Parameter(torch.tensor([0.0]))
+        self.linear = nn.Linear(self._encode_dim + self._hidden_dim, self._hidden_dim)
+        self.linear1 = VGRULinear(self._hidden_dim, self._hidden_dim * 2, bias=1.0)
+        self.linear2 = VGRULinear(self._hidden_dim, self._hidden_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weights, gain=nn.init.calculate_gain("tanh"))
+
+    def forward(self, inputs, hidden_state, feat):
+        batch_size, num_nodes = inputs.shape[0], inputs.shape[1]
+        concatenation = torch.sigmoid(self.linear1(inputs, hidden_state))
+        r, u = torch.chunk(concatenation, chunks=2, dim=1)
+        c = torch.tanh(self.linear2(inputs, r * hidden_state))
+        new_hidden_state = u * hidden_state + (1 - u) * c
+
+        new_hidden_state = new_hidden_state.reshape((batch_size * num_nodes, self._hidden_dim))
+        feat = feat.reshape((batch_size * num_nodes, feat.shape[-1]))
+        feat = feat @ self.weights + self.bias
+        new_hidden_state = torch.cat((new_hidden_state, feat), 1)
+        new_hidden_state = self.linear(new_hidden_state)
+        new_hidden_state = new_hidden_state.reshape((batch_size, num_nodes * self._hidden_dim))
+
+        return new_hidden_state, new_hidden_state
+
+
+class VGRU_FEAT(nn.Module):
+    def __init__(self, hidden_dim: int, output_dim: int, encode_dim: int):
+        super(VGRU_FEAT, self).__init__()
+        self._encode_dim = encode_dim
+        self._hidden_dim = hidden_dim
+        self._output_dim = output_dim
+        self.vgru_cell = VGRUCell(self._hidden_dim, self._encode_dim)
+
+    def forward(self, inputs, feat):
+        batch_size, seq_len, num_nodes = inputs.shape
+        outputs = list()
+        hidden_state = torch.zeros(batch_size, num_nodes * self._hidden_dim).type_as(inputs)
+        for i in range(seq_len):
+            output, hidden_state = self.vgru_cell(inputs[:, i, :], hidden_state, feat)
+            output = output.reshape((batch_size, num_nodes, self._hidden_dim))
+            outputs.append(output)
+        last_output = outputs[-1]
+        last_output = last_output.reshape((-1, last_output.size(2)))
+
+        return last_output
+
+class Extractor_N2V(nn.Module):
+
+    def __init__(self, input_dim, hidden_dim: int, encode_dim, device, batch_size, etype):
+        super(Extractor_N2V, self).__init__()
+        self.device = device
+        self.batch_size = batch_size
+        self.etype = etype
+        self._input_dim = input_dim
+        self._encode_dim = encode_dim
+        self._hidden_dim = hidden_dim
+        self.adj_encoderlayer1 = nn.Linear(input_dim, hidden_dim)
+        self.adj_encoderlayer2 = nn.Linear(hidden_dim, encode_dim)
+        self.batch_norm = nn.BatchNorm1d(encode_dim)
+        self.eps1 = nn.Parameter(torch.tensor([1.0]))
+
+    def forward(self, h, adj):
+        h = self.adj_encoderlayer1(h.float())
+        if self.etype == "gin":
+            pooled = torch.spmm(adj.float(), h.float())
+            degree = torch.spmm(adj.float(), torch.ones((adj.shape[0], 1)).float().to(self.device)).to(
+                self.device)
+            pooled = pooled / degree
+            h = pooled + self.eps1 * h
+
+        h = self.batch_norm(h.float())
+        h = self.adj_encoderlayer2(h.float())
+
+        return h
+
+class DASTNet(nn.Module):
+    def __init__(self, input_dim, hidden_dim, encode_dim, device, batch_size, etype, pre_len, dataset, ft_dataset,
+                 adj_nycbike, adj_washington, adj_chicago, adj_labike):
+        super(DASTNet, self).__init__()
+        self.dataset = dataset
+        self.finetune_dataset = ft_dataset
+        self.nycbike_adj = adj_nycbike
+        self.washington_adj = adj_washington
+        self.chicago_adj = adj_chicago
+        self.labike_adj = adj_labike
+
+        self.batch_size = batch_size
+        self.hidden_dim = hidden_dim
+        self.encode_dim = encode_dim
+        self.device = device
+
+        self.nycbike_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+        self.washington_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+        self.chicago_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+        self.labike_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+        self.shared_nycbike_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+        self.shared_washington_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+        self.shared_chicago_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+        self.shared_labike_featExtractor = Extractor_N2V(input_dim, hidden_dim, encode_dim, device, batch_size, etype).to(device)
+
+        self.speed_predictor = VGRU_FEAT(hidden_dim=hidden_dim, output_dim=pre_len, encode_dim=encode_dim).to(device)
+        self.nycbike_linear = nn.Linear(hidden_dim, pre_len, )
+        self.washington_linear = nn.Linear(hidden_dim, pre_len, )
+        self.chicago_linear = nn.Linear(hidden_dim, pre_len, )
+        self.labike_linear = nn.Linear(hidden_dim, pre_len, )
+
+        self.weight_feat_private = nn.Parameter(torch.tensor([1.0]).to(self.device))
+        self.weight_feat_shared = nn.Parameter(torch.tensor([0.0]).to(self.device))
+        self.private_nycbike_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.private_washington_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.private_chicago_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.private_labike_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.shared_nycbike_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.shared_washington_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.shared_chicago_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.shared_labike_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.combine_nycbike_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.combine_washington_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.combine_chicago_linear = nn.Linear(hidden_dim, hidden_dim, )
+        self.combine_labike_linear = nn.Linear(hidden_dim, hidden_dim, )
+
+    def forward(self, vec_nycbike, vec_washington, vec_chicago, vec_labike, feat, eval):
+        if self.dataset != self.finetune_dataset:
+            if not eval:
+                shared_nycbike_feat = self.shared_nycbike_featExtractor(vec_nycbike, self.nycbike_adj).to(self.device)
+                shared_washington_feat = self.shared_washington_featExtractor(vec_washington, self.washington_adj).to(self.device)
+                shared_chicago_feat = self.shared_chicago_featExtractor(vec_chicago, self.chicago_adj).to(self.device)
+                shared_labike_feat = self.shared_labike_featExtractor(vec_labike, self.labike_adj).to(self.device)
+            else:
+                if self.dataset == 'nycbike':
+                    shared_nycbike_feat = self.shared_nycbike_featExtractor(vec_nycbike, self.nycbike_adj).to(self.device)
+                elif self.dataset == 'washington':
+                    shared_washington_feat = self.shared_washington_featExtractor(vec_washington, self.washington_adj).to(self.device)
+                elif self.dataset == 'chicago':
+                    shared_chicago_feat = self.shared_chicago_featExtractor(vec_chicago, self.chicago_adj).to(self.device)
+                elif self.dataset == 'labike':
+                    shared_labike_feat = self.shared_labike_featExtractor(vec_labike, self.labike_adj).to(self.device)
+
+            if self.dataset == 'nycbike':
+                h_nycbike = shared_nycbike_feat.expand(self.batch_size, self.nycbike_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_nycbike)
+                pred = self.nycbike_linear(pred)
+                pred = pred.reshape((self.batch_size, self.nycbike_adj.shape[0], -1))
+            elif self.dataset == 'washington':
+                h_washington = shared_washington_feat.expand(self.batch_size, self.washington_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_washington)
+                pred = self.washington_linear(pred)
+                pred = pred.reshape((self.batch_size, self.washington_adj.shape[0], -1))
+            elif self.dataset == 'chicago':
+                h_chicago = shared_chicago_feat.expand(self.batch_size, self.chicago_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_chicago)
+                pred = self.chicago_linear(pred)
+                pred = pred.reshape((self.batch_size, self.chicago_adj.shape[0], -1))
+            elif self.dataset == 'labike':
+                h_labike = shared_labike_feat.expand(self.batch_size, self.labike_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_labike)
+                pred = self.labike_linear(pred)
+                pred = pred.reshape((self.batch_size, self.labike_adj.shape[0], -1))
+
+            if not eval:
+                return pred, shared_nycbike_feat, shared_washington_feat, shared_chicago_feat, shared_labike_feat
+            else:
+                return pred
+        else:
+            if self.dataset == 'nycbike':
+                shared_nycbike_feat = self.shared_nycbike_featExtractor(vec_nycbike, self.nycbike_adj).to(self.device)
+                nycbike_feat = self.nycbike_featExtractor(vec_nycbike, self.nycbike_adj).to(self.device)
+                nycbike_feat = self.combine_nycbike_linear(self.private_nycbike_linear(nycbike_feat) + self.shared_nycbike_linear(shared_nycbike_feat))
+                h_nycbike = nycbike_feat.expand(self.batch_size, self.nycbike_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_nycbike)
+                pred = self.nycbike_linear(pred)
+                pred = pred.reshape((self.batch_size, self.nycbike_adj.shape[0], -1))
+            elif self.dataset == 'washington':
+                shared_washington_feat = self.shared_washington_featExtractor(vec_washington, self.washington_adj).to(self.device)
+                washington_feat = self.washington_featExtractor(vec_washington, self.washington_adj).to(self.device)
+                washington_feat = self.combine_washington_linear(self.private_washington_linear(washington_feat) + self.shared_washington_linear(shared_washington_feat))
+                h_washington = washington_feat.expand(self.batch_size, self.washington_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_washington)
+                pred = self.washington_linear(pred)
+                pred = pred.reshape((self.batch_size, self.washington_adj.shape[0], -1))
+            elif self.dataset == 'chicago':
+                shared_chicago_feat = self.shared_chicago_featExtractor(vec_chicago, self.chicago_adj).to(self.device)
+                chicago_feat = self.chicago_featExtractor(vec_chicago, self.chicago_adj).to(self.device)
+                chicago_feat = self.combine_chicago_linear(self.private_chicago_linear(chicago_feat) + self.shared_chicago_linear(shared_chicago_feat))
+                h_chicago = chicago_feat.expand(self.batch_size, self.chicago_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_chicago)
+                pred = self.chicago_linear(pred)
+                pred = pred.reshape((self.batch_size, self.chicago_adj.shape[0], -1))
+            elif self.dataset == 'labike':
+                shared_labike_feat = self.shared_labike_featExtractor(vec_labike, self.labike_adj).to(self.device)
+                labike_feat = self.labike_featExtractor(vec_labike, self.labike_adj).to(self.device)
+                labike_feat = self.combine_labike_linear(self.private_labike_linear(labike_feat) + self.shared_labike_linear(shared_labike_feat))
+                h_labike = labike_feat.expand(self.batch_size, self.labike_adj.shape[0], self.encode_dim)
+                pred = self.speed_predictor(feat, h_labike)
+                pred = self.labike_linear(pred)
+                pred = pred.reshape((self.batch_size, self.labike_adj.shape[0], -1))
+
+            return pred
