@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ===== 从你现有代码 import =====
+# ===== 从现有代码 import =====
 from main import (
     MSDAN,
     MultiSourceDataLoader,
