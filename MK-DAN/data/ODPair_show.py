@@ -7,7 +7,7 @@ from matplotlib.colors import LogNorm  # 对数色标（适用于流量差异大
 
 
 # 读取OD Pairs数据
-with open('E:/trans/DAN/MK-DAN/data/NYCBike/NYCBike_OD', 'r') as f:
+with open('E:/CSFSL&MK-DAN/MK-DAN/data/Washington/Washington_OD', 'r') as f:
     od_dict = ast.literal_eval(f.read())  # 将字符串转为字典
 
 # 提取所有OD对编号
@@ -37,14 +37,14 @@ heatmap = sns.heatmap(
     cbar_kws={'label': 'Traffic Flow'}
 )
 cbar = heatmap.collections[0].colorbar
-cbar.set_label('Traffic Flow', size=16)
+cbar.set_label('Traffic Flow', size=18)
 # 将标题放在图下方，调整位置和边距
-plt.title('LosAngeles OD Flow Heatmap',
-          fontsize=18,
+plt.title('Washington OD Flow Heatmap',
+          fontsize=20,
           y=-0.15,      # 控制标题的垂直位置（负值表示在图下方）
           pad=40)       # 调整标题与图的间距
-plt.xlabel('Destination Area ID', fontsize=16)
-plt.ylabel('Origin Area ID', fontsize=16)
+plt.xlabel('Destination Area ID', fontsize=18)
+plt.ylabel('Origin Area ID', fontsize=18)
 plt.tight_layout()
 plt.subplots_adjust(bottom=0.1)  # 增加底部边距，确保标题可见
 plt.show()
