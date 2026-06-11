@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-data = np.load('E:/trans/DAN/MK-DAN/data/LABike/LABike_poi.npy')  # 替换为你的npy文件路径
+data = np.load('E:/CSFSL&MK-DAN/MK-DAN/data/Washington/Washington_poi.npy')  # 替换为你的npy文件路径
 # 如果数据是浮点数，转换为整数
 if data.dtype == float:
     data = data.astype(int)  # 强制转换为整数
@@ -28,7 +28,7 @@ for i in range(n_poi_types):
     bottom += data[:, i]
 
 # 将标题放在图下方，调整位置和边距
-plt.title('LosAngeles POI Distribution',
+plt.title('Washington POI Distribution',
           fontsize=18,
           y=-0.15,      # 控制标题的垂直位置（负值表示在图下方）
           pad=-5)       # 调整标题与图的间距
